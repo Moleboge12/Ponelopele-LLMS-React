@@ -1,240 +1,526 @@
+
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import mysql from 'mysql2/promise';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import multer from 'multer';
-import path from 'path';
 import fs from 'fs';
 
 dotenv.config();
+
 const app = express();
 const PORT = process.env.PORT || 5000;
-const JWT_SECRET = process.env.JWT_SECRET || 'ponelepele_secret_2024';
 
-app.use(cors({origin:true, credentials:true}));
-app.use(express.json());
+if (!process.env.JWT_SECRET) {
+  throw new Error('JWT_SECRET is missing from environment variables');
+}
+
+const JWT_SECRET = process.env.JWT_SECRET;
+
+app.use(cors({
+  origin: process.env.FRONTEND_URL
+    ? process.env.FRONTEND_URL.split(',').map(url => url.trim())
+    : true,
+  credentials: true
+}));
+
+app.use(express.json({ limit: '10mb' }));
 app.use('/uploads', express.static('uploads'));
 
-if(!fs.existsSync('uploads')) fs.mkdirSync('uploads');
-const storage = multer.diskStorage({
-  destination: 'uploads/',
-  filename: (req,file,cb)=> cb(null, Date.now()+'-'+file.originalname)
-});
-const upload = multer({storage});
-
 let db;
-async function connectDB(){
-  try{
-    db = await mysql.createPool({
-      host: process.env.DB_HOST || 'localhost',
-      user: process.env.DB_USER || 'root',
-      password: process.env.DB_PASS || '',
-      database: process.env.DB_NAME || 'llms_db',
-      waitForConnections: true
-    });
-    await db.query('SELECT 1');
-    console.log('MySQL Connected - llms_db');
-  }catch(e){
-    console.log('MySQL not connected, using memory fallback. Error:', e.message);
-    db = null;
-  }
-}
-await connectDB();
 
-function auth(req,res,next){
+async function connectDB() {
+  const required = ['DB_HOST', 'DB_USER', 'DB_PASS', 'DB_NAME'];
+
+  for (const variable of required) {
+    if (!process.env[variable]) {
+      throw new Error(`${variable} is missing from environment variables`);
+    }
+  }
+
+  if (!process.env.DB_SSL_CA_PATH) {
+    throw new Error('DB_SSL_CA_PATH is missing. TiDB requires an SSL certificate.');
+  }
+
+  const ca = fs.readFileSync(process.env.DB_SSL_CA_PATH, 'utf8');
+
+  db = mysql.createPool({
+    host: process.env.DB_HOST,
+    port: Number(process.env.DB_PORT || 4000),
+    user: process.env.DB_USER,
+    password: process.env.DB_PASS,
+    database: process.env.DB_NAME,
+    ssl: {
+      ca,
+      rejectUnauthorized: true
+    },
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0,
+    enableKeepAlive: true
+  });
+
+  await db.query('SELECT 1');
+
+  console.log('Successfully connected to TiDB Cloud database.');
+}
+
+function auth(req, res, next) {
   const token = req.headers.authorization?.split(' ')[1];
-  if(!token) return res.status(401).json({message:'No token'});
-  try{
+
+  if (!token) {
+    return res.status(401).json({ message: 'No token provided' });
+  }
+
+  try {
     req.user = jwt.verify(token, JWT_SECRET);
     next();
-  }catch{ return res.status(401).json({message:'Invalid token'}); }
+  } catch {
+    return res.status(401).json({ message: 'Invalid or expired token' });
+  }
 }
 
-let memory = { users: [
-  {id:1, name:'Admin', email:'admin@ponelepele.edu', password: bcrypt.hashSync('Admin123!',10), role:'admin'},
-  {id:2, name:'Learner One', email:'learner1@ponelepele.edu', password: bcrypt.hashSync('Learner123!',10), role:'learner'}
-], laptops: [
-  {id:1, asset_tag:'PO-001', brand:'Dell', model:'Latitude 5420', specs:'i5 8GB 256GB', status:'available'},
-  {id:2, asset_tag:'PO-002', brand:'HP', model:'ProBook 450', specs:'i7 16GB 512GB', status:'available'},
-], loans: [], notifications: [] };
-
-app.get('/', (req,res)=> res.json({message:'LLMS Backend running on http://localhost:5000', db: !!db}));
-
-app.post('/api/auth/login', async (req,res)=>{
-  const {email,password} = req.body;
-  console.log('Login attempt:', email);
-  if(!email || !password) return res.status(400).json({message:'Email and password required'});
-  try{
-    let user;
-    if(db){
-      const [rows] = await db.query('SELECT * FROM users WHERE email=?', [email]);
-      user = rows[0];
-    } else {
-      user = memory.users.find(u=>u.email===email);
-    }
-    if(!user) return res.status(400).json({message:'Invalid credentials'});
-    // FIX: handle both password and password_hash column names
-    const hash = user.password || user.password_hash;
-    if(!hash){
-      console.log('User has no password hash:', user);
-      return res.status(500).json({message:'User password not set in DB, run seed'});
-    }
-    const ok = await bcrypt.compare(password, hash);
-    if(!ok) return res.status(400).json({message:'Invalid credentials'});
-    const token = jwt.sign({id:user.id, email:user.email, role:user.role, name:user.name}, JWT_SECRET, {expiresIn:'7d'});
-    res.json({token, user:{id:user.id, name:user.name, email:user.email, role:user.role}});
-  }catch(e){ console.error('Login error:', e); res.status(500).json({message:e.message}); }
+// Root and health check
+app.get('/', (req, res) => {
+  res.json({
+    message: 'Ponelopele LLMS Backend is running',
+    database: db ? 'Connected' : 'Disconnected'
+  });
 });
 
-app.post('/api/auth/register', async (req,res)=>{
-  const {name,email,password,role} = req.body;
-  if(!name||!email||!password) return res.status(400).json({message:'All fields required'});
-  try{
-    const hash = await bcrypt.hash(password,10);
-    const r = role==='admin' ? 'admin' : 'learner';
-    if(db){
-      try{
-        await db.query('INSERT INTO users (name,email,password,role) VALUES (?,?,?,?)', [name,email,hash,r]);
-      }catch(e){
-        if(e.code==='ER_BAD_FIELD_ERROR'){
-          await db.query('INSERT INTO users (name,email,password_hash,role) VALUES (?,?,?,?)', [name,email,hash,r]);
-        } else throw e;
-      }
-      const [rows] = await db.query('SELECT * FROM users WHERE email=?', [email]);
-      const user = rows[0];
-      const token = jwt.sign({id:user.id, email:user.email, role:user.role, name:user.name}, JWT_SECRET, {expiresIn:'7d'});
-      return res.json({token, user:{id:user.id, name:user.name, email:user.email, role:user.role}});
-    } else {
-      const id = memory.users.length+1;
-      const user = {id, name, email, password:hash, role:r};
-      memory.users.push(user);
-      const token = jwt.sign({id, email, role:r, name}, JWT_SECRET, {expiresIn:'7d'});
-      return res.json({token, user:{id, name, email, role:r}});
-    }
-  }catch(e){
-    if(e.code==='ER_DUP_ENTRY') return res.status(400).json({message:'Email already exists'});
-    res.status(500).json({message:e.message});
+app.get('/health', async (req, res) => {
+  try {
+    await db.query('SELECT 1');
+    res.json({ status: 'healthy', database: 'connected' });
+  } catch {
+    res.status(503).json({
+      status: 'unhealthy',
+      database: 'disconnected'
+    });
   }
 });
 
-app.get('/api/laptops', auth, async (req,res)=>{
-  try{
-    if(db){
-      const [rows] = await db.query('SELECT * FROM laptops');
-      return res.json(rows);
+// REGISTER
+app.post('/api/auth/register', async (req, res) => {
+  const { name, email, password, role } = req.body;
+
+  if (!name || !email || !password) {
+    return res.status(400).json({ message: 'All fields are required' });
+  }
+
+  if (password.length < 8) {
+    return res.status(400).json({
+      message: 'Password must contain at least 8 characters'
+    });
+  }
+
+  const userRole = role === 'admin' ? 'admin' : 'learner';
+
+  try {
+    const hash = await bcrypt.hash(password, 10);
+
+    const [result] = await db.query(
+      'INSERT INTO users (name, email, password, role) VALUES (?, ?, ?, ?)',
+      [name.trim(), email.trim().toLowerCase(), hash, userRole]
+    );
+
+    const user = {
+      id: result.insertId,
+      name: name.trim(),
+      email: email.trim().toLowerCase(),
+      role: userRole
+    };
+
+    const token = jwt.sign(user, JWT_SECRET, { expiresIn: '7d' });
+
+    res.status(201).json({ token, user });
+  } catch (error) {
+    if (error.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ message: 'Email already exists' });
     }
-    res.json(memory.laptops);
-  }catch(e){ res.json(memory.laptops); }
+
+    console.error('Registration error:', error.message);
+    res.status(500).json({ message: 'Registration failed' });
+  }
 });
 
-app.post('/api/laptops', auth, async (req,res)=>{
-  if(req.user.role!=='admin') return res.status(403).json({message:'Admin only'});
-  const {asset_tag,brand,model,specs,status} = req.body;
-  try{
-    if(db){
-      await db.query('INSERT INTO laptops (asset_tag,brand,model,specs,status) VALUES (?,?,?,?,?)', [asset_tag,brand,model,specs,status||'available']);
-      const [rows] = await db.query('SELECT * FROM laptops');
-      return res.json(rows);
+// LOGIN
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({
+      message: 'Email and password are required'
+    });
+  }
+
+  try {
+    const [rows] = await db.query(
+      'SELECT * FROM users WHERE email = ?',
+      [email.trim().toLowerCase()]
+    );
+
+    const user = rows[0];
+
+    if (!user) {
+      return res.status(401).json({ message: 'Invalid credentials' });
     }
-    memory.laptops.push({id:memory.laptops.length+1, asset_tag,brand,model,specs,status:status||'available'});
-    res.json(memory.laptops);
-  }catch(e){ res.status(500).json({message:e.message}); }
-});
 
-app.get('/api/loans', auth, async (req,res)=>{
-  if(req.user.role!=='admin') return res.status(403).json({message:'Admin only'});
-  try{
-    if(db){
-      await db.query("UPDATE loans SET status='overdue' WHERE status='issued' AND DATEDIFF(NOW(), issued_at) > 21");
-      const [rows] = await db.query(`SELECT loans.*, users.name as user_name, users.email, laptops.brand, laptops.model, laptops.asset_tag FROM loans JOIN users ON loans.user_id=users.id JOIN laptops ON loans.laptop_id=laptops.id ORDER BY loans.created_at DESC`);
-      return res.json(rows);
+    const hash = user.password || user.password_hash;
+
+    if (!hash) {
+      return res.status(500).json({
+        message: 'Account password is not configured'
+      });
     }
-    memory.loans.forEach(l=>{ if(l.status==='issued' && l.issued_at){ const diff=(Date.now()-new Date(l.issued_at))/86400000; if(diff>21) l.status='overdue'; } });
-    res.json(memory.loans);
-  }catch(e){ res.json(memory.loans); }
-});
 
-app.get('/api/loans/my', auth, async (req,res)=>{
-  try{
-    if(db){
-      const [rows] = await db.query(`SELECT loans.*, laptops.brand, laptops.model, laptops.asset_tag FROM loans JOIN laptops ON loans.laptop_id=laptops.id WHERE loans.user_id=? ORDER BY loans.created_at DESC`, [req.user.id]);
-      return res.json(rows);
+    const validPassword = await bcrypt.compare(password, hash);
+
+    if (!validPassword) {
+      return res.status(401).json({ message: 'Invalid credentials' });
     }
-    res.json(memory.loans.filter(l=>l.user_id===req.user.id));
-  }catch(e){ res.json(memory.loans.filter(l=>l.user_id===req.user.id)); }
+
+    const userData = {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      role: user.role
+    };
+
+    const token = jwt.sign(userData, JWT_SECRET, {
+      expiresIn: '7d'
+    });
+
+    res.json({ token, user: userData });
+  } catch (error) {
+    console.error('Login error:', error.message);
+    res.status(500).json({ message: 'Login failed' });
+  }
 });
 
-app.post('/api/loans', auth, async (req,res)=>{
-  if(req.user.role==='admin') return res.status(403).json({message:'Admins cannot request laptops'});
-  const {laptop_id, purpose} = req.body;
-  try{
-    if(db){
-      const [active] = await db.query("SELECT * FROM loans WHERE user_id=? AND status IN ('pending','approved','issued','overdue')", [req.user.id]);
-      if(active.length>0) return res.status(400).json({message:'You already have an active loan, return first'});
-      await db.query('INSERT INTO loans (user_id,laptop_id,purpose,status) VALUES (?,?,?,?)', [req.user.id,laptop_id,purpose,'pending']);
-      return res.json({message:'Request submitted'});
+// GET LAPTOPS
+app.get('/api/laptops', auth, async (req, res) => {
+  try {
+    const [rows] = await db.query('SELECT * FROM laptops ORDER BY id DESC');
+    res.json(rows);
+  } catch (error) {
+    console.error('Laptop retrieval error:', error.message);
+    res.status(500).json({ message: 'Could not retrieve laptops' });
+  }
+});
+
+// ADD LAPTOP
+app.post('/api/laptops', auth, async (req, res) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ message: 'Admin access required' });
+  }
+
+  const { asset_tag, brand, model, specs, status } = req.body;
+
+  if (!asset_tag || !brand || !model) {
+    return res.status(400).json({
+      message: 'Asset tag, brand and model are required'
+    });
+  }
+
+  try {
+    await db.query(
+      `INSERT INTO laptops
+       (asset_tag, brand, model, specs, status)
+       VALUES (?, ?, ?, ?, ?)`,
+      [asset_tag, brand, model, specs || '', status || 'available']
+    );
+
+    const [rows] = await db.query('SELECT * FROM laptops ORDER BY id DESC');
+    res.status(201).json(rows);
+  } catch (error) {
+    console.error('Laptop creation error:', error.message);
+
+    if (error.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ message: 'Asset tag already exists' });
     }
-    if(memory.loans.find(l=>l.user_id===req.user.id && ['pending','approved','issued','overdue'].includes(l.status))) return res.status(400).json({message:'You already have an active loan'});
-    memory.loans.push({id:memory.loans.length+1, user_id:req.user.id, laptop_id, purpose, status:'pending', user_name:req.user.name, brand:'Laptop', model:'', created_at:new Date()});
-    res.json({message:'Request submitted'});
-  }catch(e){ res.status(500).json({message:e.message}); }
+
+    res.status(500).json({ message: 'Could not add laptop' });
+  }
 });
 
-app.put('/api/loans/:id/status', auth, async (req,res)=>{
-  if(req.user.role!=='admin') return res.status(403).json({message:'Admin only'});
-  const {status, collection_date, collection_location, admin_note} = req.body;
-  const {id} = req.params;
-  try{
-    if(!status) return res.status(400).json({message:'Status required'});
-    if(status==='approved' && !collection_date) return res.status(400).json({message:'Collection date required'});
-    if(status==='rejected' && !admin_note) return res.status(400).json({message:'Rejection reason required'});
-    
-    let loanUser;
-    if(db){
-      const [rows] = await db.query('SELECT * FROM loans WHERE id=?', [id]);
-      loanUser = rows[0];
-      let query = 'UPDATE loans SET status=?';
-      let params = [status];
-      if(status==='approved'){ query+=', collection_date=?, collection_location=?, admin_note=?'; params.push(collection_date,collection_location,admin_note); }
-      else if(status==='rejected'){ query+=', admin_note=?'; params.push(admin_note); }
-      else if(status==='issued'){ query+=', issued_at=NOW(), admin_note=?'; params.push(admin_note||''); const [l] = await db.query('SELECT laptop_id FROM loans WHERE id=?',[id]); if(l[0]) await db.query('UPDATE laptops SET status=? WHERE id=?',['loaned', l[0].laptop_id]); }
-      else if(status==='returned'){ query+=', returned_at=NOW()'; const [l] = await db.query('SELECT laptop_id FROM loans WHERE id=?',[id]); if(l[0]) await db.query('UPDATE laptops SET status=? WHERE id=?',['available', l[0].laptop_id]); }
-      query+=' WHERE id=?'; params.push(id);
-      await db.query(query, params);
-      
-      let notifTitle='', notifMsg='';
-      if(status==='approved'){ notifTitle='Request Approved - Ready for Collection'; notifMsg=`Collect your laptop from ${collection_location} on ${collection_date}. Note: ${admin_note||''}`; }
-      if(status==='rejected'){ notifTitle='Request Rejected'; notifMsg=`Your request rejected. Reason: ${admin_note}`; }
-      if(status==='issued'){ notifTitle='Laptop Issued'; notifMsg='Your laptop has been issued. Return within 3 weeks.'; }
-      if(status==='returned'){ notifTitle='Laptop Returned'; notifMsg='Thank you for returning the laptop.'; }
-      if(notifTitle && loanUser) await db.query('INSERT INTO notifications (user_id,title,message) VALUES (?,?,?)', [loanUser.user_id, notifTitle, notifMsg]);
-      
-      return res.json({message:'Status updated'});
+// ADMIN: GET ALL LOANS
+app.get('/api/loans', auth, async (req, res) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ message: 'Admin access required' });
+  }
+
+  try {
+    await db.query(
+      `UPDATE loans
+       SET status = 'overdue'
+       WHERE status = 'issued'
+       AND issued_at < DATE_SUB(NOW(), INTERVAL 21 DAY)`
+    );
+
+    const [rows] = await db.query(`
+      SELECT loans.*,
+             users.name AS user_name,
+             users.email,
+             laptops.brand,
+             laptops.model,
+             laptops.asset_tag
+      FROM loans
+      JOIN users ON loans.user_id = users.id
+      JOIN laptops ON loans.laptop_id = laptops.id
+      ORDER BY loans.created_at DESC
+    `);
+
+    res.json(rows);
+  } catch (error) {
+    console.error('Loan retrieval error:', error.message);
+    res.status(500).json({ message: 'Could not retrieve loans' });
+  }
+});
+
+// LEARNER: GET MY LOANS
+app.get('/api/loans/my', auth, async (req, res) => {
+  try {
+    const [rows] = await db.query(`
+      SELECT loans.*,
+             laptops.brand,
+             laptops.model,
+             laptops.asset_tag
+      FROM loans
+      JOIN laptops ON loans.laptop_id = laptops.id
+      WHERE loans.user_id = ?
+      ORDER BY loans.created_at DESC
+    `, [req.user.id]);
+
+    res.json(rows);
+  } catch (error) {
+    console.error('My loans error:', error.message);
+    res.status(500).json({ message: 'Could not retrieve your loans' });
+  }
+});
+
+// LEARNER: REQUEST LAPTOP
+app.post('/api/loans', auth, async (req, res) => {
+  if (req.user.role === 'admin') {
+    return res.status(403).json({
+      message: 'Administrators cannot request laptops'
+    });
+  }
+
+  const { laptop_id, purpose } = req.body;
+
+  if (!laptop_id) {
+    return res.status(400).json({ message: 'Select a laptop' });
+  }
+
+  try {
+    const [active] = await db.query(
+      `SELECT id FROM loans
+       WHERE user_id = ?
+       AND status IN ('pending', 'approved', 'issued', 'overdue')`,
+      [req.user.id]
+    );
+
+    if (active.length > 0) {
+      return res.status(400).json({
+        message: 'You already have an active loan'
+      });
     }
-    const loan = memory.loans.find(l=>l.id==id);
-    if(loan){ loan.status=status; loan.admin_note=admin_note; loan.collection_info= collection_location+' on '+collection_date; if(status==='issued') loan.issued_at=new Date(); }
-    res.json({message:'Status updated'});
-  }catch(e){ res.status(500).json({message:e.message}); }
-});
 
-app.get('/api/notifications', auth, async (req,res)=>{
-  try{
-    if(db){
-      const [rows] = await db.query('SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC', [req.user.id]);
-      return res.json(rows);
+    const [laptops] = await db.query(
+      'SELECT * FROM laptops WHERE id = ? AND status = ?',
+      [laptop_id, 'available']
+    );
+
+    if (laptops.length === 0) {
+      return res.status(400).json({
+        message: 'This laptop is not available'
+      });
     }
-    res.json(memory.notifications.filter(n=>n.user_id===req.user.id));
-  }catch(e){ res.json([]); }
+
+    await db.query(
+      `INSERT INTO loans (user_id, laptop_id, purpose, status)
+       VALUES (?, ?, ?, 'pending')`,
+      [req.user.id, laptop_id, purpose || '']
+    );
+
+    res.status(201).json({ message: 'Laptop request submitted successfully' });
+  } catch (error) {
+    console.error('Loan request error:', error.message);
+    res.status(500).json({ message: 'Could not submit loan request' });
+  }
 });
 
-app.get('/api/users', auth, async (req,res)=>{
-  if(req.user.role!=='admin') return res.status(403).json({message:'Admin only'});
-  try{
-    if(db){ const [rows]=await db.query('SELECT id,name,email,role,created_at FROM users'); return res.json(rows); }
-    res.json(memory.users.map(u=>({id:u.id,name:u.name,email:u.email,role:u.role})));
-  }catch(e){ res.json([]); }
+// ADMIN: UPDATE LOAN STATUS
+app.put('/api/loans/:id/status', auth, async (req, res) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ message: 'Admin access required' });
+  }
+
+  const { status, collection_date, collection_location, admin_note } = req.body;
+  const { id } = req.params;
+
+  const allowedStatuses = [
+    'approved', 'rejected', 'issued', 'returned'
+  ];
+
+  if (!allowedStatuses.includes(status)) {
+    return res.status(400).json({ message: 'Invalid loan status' });
+  }
+
+  if (status === 'approved' && !collection_date) {
+    return res.status(400).json({
+      message: 'Collection date is required'
+    });
+  }
+
+  if (status === 'rejected' && !admin_note) {
+    return res.status(400).json({
+      message: 'Rejection reason is required'
+    });
+  }
+
+  let connection;
+
+  try {
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+
+    const [rows] = await connection.query(
+      'SELECT * FROM loans WHERE id = ? FOR UPDATE',
+      [id]
+    );
+
+    const loan = rows[0];
+
+    if (!loan) {
+      await connection.rollback();
+      return res.status(404).json({ message: 'Loan not found' });
+    }
+
+    if (status === 'approved') {
+      await connection.query(
+        `UPDATE loans
+         SET status = ?, collection_date = ?,
+             collection_location = ?, admin_note = ?
+         WHERE id = ?`,
+        [status, collection_date, collection_location || '', admin_note || '', id]
+      );
+    } else if (status === 'rejected') {
+      await connection.query(
+        'UPDATE loans SET status = ?, admin_note = ? WHERE id = ?',
+        [status, admin_note, id]
+      );
+    } else if (status === 'issued') {
+      await connection.query(
+        `UPDATE loans SET status = ?, issued_at = NOW(), admin_note = ?
+         WHERE id = ?`,
+        [status, admin_note || '', id]
+      );
+
+      await connection.query(
+        'UPDATE laptops SET status = ? WHERE id = ?',
+        ['loaned', loan.laptop_id]
+      );
+    } else if (status === 'returned') {
+      await connection.query(
+        `UPDATE loans SET status = ?, returned_at = NOW()
+         WHERE id = ?`,
+        [status, id]
+      );
+
+      await connection.query(
+        'UPDATE laptops SET status = ? WHERE id = ?',
+        ['available', loan.laptop_id]
+      );
+    }
+
+    let title = '';
+    let message = '';
+
+    if (status === 'approved') {
+      title = 'Request Approved - Ready for Collection';
+      message = `Collect your laptop from ${collection_location || 'the school'} on ${collection_date}. ${admin_note || ''}`;
+    } else if (status === 'rejected') {
+      title = 'Request Rejected';
+      message = `Your request was rejected. Reason: ${admin_note}`;
+    } else if (status === 'issued') {
+      title = 'Laptop Issued';
+      message = 'Your laptop has been issued. Please return it within three weeks.';
+    } else if (status === 'returned') {
+      title = 'Laptop Returned';
+      message = 'Thank you for returning the laptop.';
+    }
+
+    if (title) {
+      await connection.query(
+        `INSERT INTO notifications (user_id, title, message)
+         VALUES (?, ?, ?)`,
+        [loan.user_id, title, message]
+      );
+    }
+
+    await connection.commit();
+
+    res.json({ message: 'Loan status updated successfully' });
+  } catch (error) {
+    if (connection) await connection.rollback();
+
+    console.error('Loan status update error:', error.message);
+    res.status(500).json({ message: 'Could not update loan status' });
+  } finally {
+    if (connection) connection.release();
+  }
 });
 
-app.listen(PORT, ()=> console.log(`LLMS Backend running on http://localhost:${PORT}`));
+// GET NOTIFICATIONS
+app.get('/api/notifications', auth, async (req, res) => {
+  try {
+    const [rows] = await db.query(
+      `SELECT * FROM notifications
+       WHERE user_id = ?
+       ORDER BY created_at DESC`,
+      [req.user.id]
+    );
+
+    res.json(rows);
+  } catch (error) {
+    console.error('Notification error:', error.message);
+    res.status(500).json({ message: 'Could not retrieve notifications' });
+  }
+});
+
+// ADMIN: GET ALL USERS
+app.get('/api/users', auth, async (req, res) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ message: 'Admin access required' });
+  }
+
+  try {
+    const [rows] = await db.query(
+      'SELECT id, name, email, role, created_at FROM users ORDER BY id DESC'
+    );
+
+    res.json(rows);
+  } catch (error) {
+    console.error('User retrieval error:', error.message);
+    res.status(500).json({ message: 'Could not retrieve users' });
+  }
+});
+
+// START SERVER ONLY AFTER DATABASE CONNECTS
+async function startServer() {
+  try {
+    await connectDB();
+
+    app.listen(PORT, () => {
+      console.log(`LLMS backend running on port ${PORT}`);
+    });
+  } catch (error) {
+    console.error('Backend startup failed:', error.message);
+    process.exit(1);
+  }
+}
+
+startServer();
